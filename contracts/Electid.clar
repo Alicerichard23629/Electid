@@ -21,11 +21,19 @@
 (define-constant err-already-voted (err u111))
 (define-constant err-proposal-closed (err u112))
 (define-constant err-invalid-proposal (err u113))
+(define-constant err-invalid-delegation (err u114))
+(define-constant err-delegation-exists (err u115))
+(define-constant err-delegation-not-found (err u116))
+(define-constant err-self-delegation (err u117))
+(define-constant err-delegation-expired (err u118))
+(define-constant err-invalid-delegation-type (err u119))
+(define-constant err-delegation-limit-exceeded (err u120))
 
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (string-ascii 256) "")
 (define-data-var last-proposal-id uint u0)
 (define-data-var last-vote-id uint u0)
+(define-data-var last-delegation-id uint u0)
 
 (define-map token-metadata uint {
   name: (string-ascii 64),
@@ -71,6 +79,24 @@
 
 (define-map proposal-types (string-ascii 64) bool)
 
+(define-map delegations uint {
+  delegator-token-id: uint,
+  delegate-token-id: uint,
+  delegation-type: (string-ascii 32),
+  jurisdiction: (string-ascii 64),
+  valid-from: uint,
+  valid-until: uint,
+  is-active: bool,
+  created-at: uint,
+  reason: (optional (string-ascii 256))
+})
+
+(define-map delegation-types (string-ascii 32) bool)
+
+(define-map active-delegations { delegator: uint, delegation-type: (string-ascii 32) } uint)
+
+(define-map delegation-counts uint uint)
+
 (define-public (initialize-contract (uri (string-ascii 256)))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -96,6 +122,10 @@
     (map-set proposal-types "BUDGET" true)
     (map-set proposal-types "APPOINTMENT" true)
     (map-set proposal-types "POLICY" true)
+    (map-set delegation-types "GENERAL" true)
+    (map-set delegation-types "TEMPORARY" true)
+    (map-set delegation-types "EMERGENCY" true)
+    (map-set delegation-types "SPECIFIC" true)
     (ok true)))
 
 (define-public (add-authorized-issuer (issuer principal))
@@ -122,6 +152,100 @@
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (ok (map-set proposal-types proposal-type true))))
+
+(define-public (add-delegation-type (delegation-type (string-ascii 32)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (ok (map-set delegation-types delegation-type true))))
+
+(define-public (create-delegation
+  (delegator-token-id uint)
+  (delegate-token-id uint)
+  (delegation-type (string-ascii 32))
+  (jurisdiction (string-ascii 64))
+  (valid-until uint)
+  (reason (optional (string-ascii 256))))
+  (let ((delegation-id (+ (var-get last-delegation-id) u1))
+        (current-height stacks-block-height)
+        (delegator-metadata (unwrap! (map-get? token-metadata delegator-token-id) err-token-not-found))
+        (delegate-metadata (unwrap! (map-get? token-metadata delegate-token-id) err-token-not-found))
+        (existing-delegation (map-get? active-delegations { delegator: delegator-token-id, delegation-type: delegation-type })))
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? elected-official delegator-token-id) err-not-token-owner)) err-not-token-owner)
+    (asserts! (not (is-eq delegator-token-id delegate-token-id)) err-self-delegation)
+    (asserts! (get verified delegator-metadata) err-not-authorized)
+    (asserts! (get verified delegate-metadata) err-not-authorized)
+    (asserts! (default-to false (map-get? delegation-types delegation-type)) err-invalid-delegation-type)
+    (asserts! (default-to false (map-get? jurisdiction-codes jurisdiction)) err-invalid-jurisdiction)
+    (asserts! (> valid-until current-height) err-invalid-delegation)
+    (asserts! (is-none existing-delegation) err-delegation-exists)
+    (asserts! (< (default-to u0 (map-get? delegation-counts delegator-token-id)) u5) err-delegation-limit-exceeded)
+    (map-set delegations delegation-id {
+      delegator-token-id: delegator-token-id,
+      delegate-token-id: delegate-token-id,
+      delegation-type: delegation-type,
+      jurisdiction: jurisdiction,
+      valid-from: current-height,
+      valid-until: valid-until,
+      is-active: true,
+      created-at: current-height,
+      reason: reason
+    })
+    (map-set active-delegations { delegator: delegator-token-id, delegation-type: delegation-type } delegation-id)
+    (map-set delegation-counts delegator-token-id (+ (default-to u0 (map-get? delegation-counts delegator-token-id)) u1))
+    (var-set last-delegation-id delegation-id)
+    (ok delegation-id)))
+
+(define-public (revoke-delegation (delegator-token-id uint) (delegation-type (string-ascii 32)))
+  (let ((delegation-id (unwrap! (map-get? active-delegations { delegator: delegator-token-id, delegation-type: delegation-type }) err-delegation-not-found))
+        (delegation (unwrap! (map-get? delegations delegation-id) err-delegation-not-found)))
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? elected-official delegator-token-id) err-not-token-owner)) err-not-token-owner)
+    (asserts! (get is-active delegation) err-delegation-expired)
+    (map-set delegations delegation-id (merge delegation { is-active: false }))
+    (map-delete active-delegations { delegator: delegator-token-id, delegation-type: delegation-type })
+    (map-set delegation-counts delegator-token-id (- (default-to u1 (map-get? delegation-counts delegator-token-id)) u1))
+    (ok true)))
+
+(define-public (cast-delegated-vote
+  (proposal-id uint)
+  (delegator-token-id uint)
+  (delegate-token-id uint)
+  (vote-choice (string-ascii 16))
+  (rationale (optional (string-ascii 256))))
+  (let ((proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+        (delegator-metadata (unwrap! (map-get? token-metadata delegator-token-id) err-token-not-found))
+        (delegate-metadata (unwrap! (map-get? token-metadata delegate-token-id) err-token-not-found))
+        (vote-id (+ (var-get last-vote-id) u1))
+        (current-height stacks-block-height)
+        (jurisdiction (get jurisdiction proposal))
+        (delegation-id (unwrap! (map-get? active-delegations { delegator: delegator-token-id, delegation-type: "GENERAL" }) err-delegation-not-found))
+        (delegation (unwrap! (map-get? delegations delegation-id) err-delegation-not-found)))
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? elected-official delegate-token-id) err-not-token-owner)) err-not-token-owner)
+    (asserts! (get verified delegator-metadata) err-not-authorized)
+    (asserts! (get verified delegate-metadata) err-not-authorized)
+    (asserts! (get is-active proposal) err-proposal-closed)
+    (asserts! (<= current-height (get voting-deadline proposal)) err-proposal-closed)
+    (asserts! (is-none (map-get? official-votes { token-id: delegator-token-id, proposal-id: proposal-id })) err-already-voted)
+    (asserts! (or (is-eq vote-choice "YES") (or (is-eq vote-choice "NO") (is-eq vote-choice "ABSTAIN"))) err-invalid-vote)
+    (asserts! (get is-active delegation) err-delegation-expired)
+    (asserts! (<= current-height (get valid-until delegation)) err-delegation-expired)
+    (asserts! (is-eq (get delegate-token-id delegation) delegate-token-id) err-invalid-delegation)
+    (asserts! (or (is-eq (get jurisdiction delegation) jurisdiction) (is-eq (get jurisdiction delegation) "ALL")) err-invalid-jurisdiction)
+    (map-set votes vote-id {
+      proposal-id: proposal-id,
+      voter-token-id: delegator-token-id,
+      vote-choice: vote-choice,
+      voted-at: current-height,
+      rationale: rationale
+    })
+    (map-set official-votes { token-id: delegator-token-id, proposal-id: proposal-id } vote-id)
+    (map-set proposals proposal-id (merge proposal {
+      total-votes: (+ (get total-votes proposal) u1),
+      yes-votes: (if (is-eq vote-choice "YES") (+ (get yes-votes proposal) u1) (get yes-votes proposal)),
+      no-votes: (if (is-eq vote-choice "NO") (+ (get no-votes proposal) u1) (get no-votes proposal)),
+      abstain-votes: (if (is-eq vote-choice "ABSTAIN") (+ (get abstain-votes proposal) u1) (get abstain-votes proposal))
+    }))
+    (var-set last-vote-id vote-id)
+    (ok vote-id)))
 
 (define-public (mint-official-nft 
   (recipient principal)
@@ -362,6 +486,45 @@
 (define-read-only (is-valid-proposal-type (proposal-type (string-ascii 64)))
   (default-to false (map-get? proposal-types proposal-type)))
 
+(define-read-only (get-delegation (delegation-id uint))
+  (map-get? delegations delegation-id))
+
+(define-read-only (get-active-delegation (delegator-token-id uint) (delegation-type (string-ascii 32)))
+  (match (map-get? active-delegations { delegator: delegator-token-id, delegation-type: delegation-type })
+    delegation-id (map-get? delegations delegation-id)
+    none))
+
+(define-read-only (is-delegation-active (delegation-id uint))
+  (match (map-get? delegations delegation-id)
+    delegation (and (get is-active delegation) (<= stacks-block-height (get valid-until delegation)))
+    false))
+
+(define-read-only (get-delegator-count (delegator-token-id uint))
+  (default-to u0 (map-get? delegation-counts delegator-token-id)))
+
+(define-read-only (is-valid-delegation-type (delegation-type (string-ascii 32)))
+  (default-to false (map-get? delegation-types delegation-type)))
+
+(define-read-only (can-delegate-vote (delegator-token-id uint) (delegate-token-id uint) (proposal-id uint))
+  (let ((proposal (unwrap! (map-get? proposals proposal-id) false))
+        (delegation-id (unwrap! (map-get? active-delegations { delegator: delegator-token-id, delegation-type: "GENERAL" }) false))
+        (delegation (unwrap! (map-get? delegations delegation-id) false)))
+    (and 
+      (get is-active delegation)
+      (<= stacks-block-height (get valid-until delegation))
+      (is-eq (get delegate-token-id delegation) delegate-token-id)
+      (or (is-eq (get jurisdiction delegation) (get jurisdiction proposal)) (is-eq (get jurisdiction delegation) "ALL"))
+      (is-none (map-get? official-votes { token-id: delegator-token-id, proposal-id: proposal-id })))))
+
+(define-read-only (get-delegation-stats (token-id uint))
+  (some {
+    total-delegations: (default-to u0 (map-get? delegation-counts token-id)),
+    max-delegations: u5
+  }))
+
+(define-read-only (get-last-delegation-id)
+  (var-get last-delegation-id))
+
 
 (define-read-only (get-contract-info)
   {
@@ -369,5 +532,9 @@
     total-tokens: (var-get last-token-id),
     contract-uri: (var-get contract-uri),
     total-proposals: (var-get last-proposal-id),
-    total-votes: (var-get last-vote-id)
+    total-votes: (var-get last-vote-id),
+    total-delegations: (var-get last-delegation-id)
   })
+
+
+
